@@ -19,6 +19,7 @@ import math
 import time
 import argparse
 import numpy as np
+import collections
 import taichi as ti
 
 # ==============================================================================
@@ -143,6 +144,18 @@ map_point_radii = ti.field(dtype=ti.f32, shape=MAX_MAP_POINTS)
 # Stability map axes, ticks, and reference lines
 map_axis_vertices = ti.Vector.field(2, dtype=ti.f32, shape=128)
 map_axis_colors = ti.Vector.field(3, dtype=ti.f32, shape=128)
+
+# Live scientific plots rendering fields (preallocated, zero-allocation per frame)
+MAX_PLOT_VERTS = 2048
+plot_e_verts = ti.Vector.field(2, dtype=ti.f32, shape=MAX_PLOT_VERTS)
+plot_e_cols = ti.Vector.field(3, dtype=ti.f32, shape=MAX_PLOT_VERTS)
+plot_phi_verts = ti.Vector.field(2, dtype=ti.f32, shape=MAX_PLOT_VERTS)
+plot_phi_cols = ti.Vector.field(3, dtype=ti.f32, shape=MAX_PLOT_VERTS)
+
+# Indicator points on plots (e.g. current point marker)
+plot_dot_centers = ti.Vector.field(2, dtype=ti.f32, shape=4)
+plot_dot_colors = ti.Vector.field(3, dtype=ti.f32, shape=4)
+plot_dot_radii = ti.field(dtype=ti.f32, shape=4)
 
 # ==============================================================================
 # 4. TAICHI SYMPLECTIC INTEGRATION KERNELS
@@ -346,11 +359,20 @@ def get_scenario_bodies(preset_id: int, custom_test_orbit=None):
         
         # Terrestrial Test Planet: 1.0 M_Earth (3.0e-6 M_sun) at a=1.00 AU around Star A (inside HZ: 0.95 - 1.37 AU)
         m_test = 3.003e-6
-        a_test = 1.00
-        v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
-        pos_test = r_a + np.array([0.0, a_test], dtype=np.float32)
-        vel_test = v_a + np.array([-v_test_rel, 0.0], dtype=np.float32)
-        bodies.append(BodyConfig("Terrestrial Planet (Test Planet)", m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
+        if custom_test_orbit is not None:
+            a_test, e_test = custom_test_orbit
+            r_peri = a_test * (1.0 - e_test)
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) * (1.0 + e_test) / max(r_peri, 1e-6))
+            pos_test = r_a + np.array([r_peri, 0.0], dtype=np.float32)
+            vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
+            label = f"Terrestrial Planet (a0={a_test:.2f}, e0={e_test:.2f})"
+        else:
+            a_test = 1.00
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
+            pos_test = r_a + np.array([0.0, a_test], dtype=np.float32)
+            vel_test = v_a + np.array([-v_test_rel, 0.0], dtype=np.float32)
+            label = "Terrestrial Planet (Test Planet)"
+        bodies.append(BodyConfig(label, m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
 
     elif preset_id == 2:
         description = "Nominal 3:1 Mean Motion Resonance: Initial a_giant = 2.080 AU, a_test = 1.000 AU (a_ratio ~ 2.080, P_ratio ~ 3.0)"
@@ -409,11 +431,20 @@ def get_scenario_bodies(preset_id: int, custom_test_orbit=None):
         bodies.append(BodyConfig("Giant Planet", m_giant, 0.016, (0.95, 0.65, 0.25), pos_giant, vel_giant))
         
         m_test = 3.003e-6
-        a_test = 1.00
-        v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
-        pos_test = r_a + np.array([a_test, 0.0], dtype=np.float32)
-        vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
-        bodies.append(BodyConfig("Terrestrial Planet", m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
+        if custom_test_orbit is not None:
+            a_test, e_test = custom_test_orbit
+            r_peri = a_test * (1.0 - e_test)
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) * (1.0 + e_test) / max(r_peri, 1e-6))
+            pos_test = r_a + np.array([r_peri, 0.0], dtype=np.float32)
+            vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
+            label = f"Terrestrial Planet (a0={a_test:.2f}, e0={e_test:.2f})"
+        else:
+            a_test = 1.00
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
+            pos_test = r_a + np.array([a_test, 0.0], dtype=np.float32)
+            vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
+            label = "Terrestrial Planet"
+        bodies.append(BodyConfig(label, m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
 
     elif preset_id == 4:
         description = "Kepler 3rd Law Benchmark: Single Star (1.0 M_sun) + Circular Orbit (a = 1.00 AU)"
@@ -422,9 +453,20 @@ def get_scenario_bodies(preset_id: int, custom_test_orbit=None):
         bodies.append(BodyConfig("Host Star", m_a, 0.035, (1.0, 0.92, 0.40), [0.0, 0.0], [0.0, 0.0], is_star=True))
         
         m_test = 3.003e-6
-        a_test = 1.00
-        v_test = math.sqrt(G_SIM * (m_a + m_test) / a_test) # exactly 2 * pi
-        bodies.append(BodyConfig("Kepler Planet (1.0 AU)", m_test, 0.012, (0.25, 0.85, 1.0), [a_test, 0.0], [0.0, v_test]))
+        if custom_test_orbit is not None:
+            a_test, e_test = custom_test_orbit
+            r_peri = a_test * (1.0 - e_test)
+            v_test = math.sqrt(G_SIM * (m_a + m_test) * (1.0 + e_test) / max(r_peri, 1e-6))
+            pos_test = [r_peri, 0.0]
+            vel_test = [0.0, v_test]
+            label = f"Kepler Planet (a0={a_test:.2f}, e0={e_test:.2f})"
+        else:
+            a_test = 1.00
+            v_test = math.sqrt(G_SIM * (m_a + m_test) / a_test) # exactly 2 * pi
+            pos_test = [a_test, 0.0]
+            vel_test = [0.0, v_test]
+            label = "Kepler Planet (1.0 AU)"
+        bodies.append(BodyConfig(label, m_test, 0.012, (0.25, 0.85, 1.0), pos_test, vel_test))
 
     return bodies, description, target_resonance_label
 
@@ -546,6 +588,23 @@ class AstrophysicsEngine:
         self.snow_line_au = 2.70
         self.total_flux_test = 1.0
         self.flux_status = "INSIDE APPROXIMATE HZ"
+
+        # Rolling live history buffers for e(t) and phi(t) (preallocated O(1) circular deques)
+        self.e_history_t = collections.deque(maxlen=600)
+        self.e_history_val = collections.deque(maxlen=600)
+        self.phi_plot_t = collections.deque(maxlen=600)
+        self.phi_plot_val = collections.deque(maxlen=600)
+        self.e_history_window = 8.0 # Rolling window in simulation years (~8 years)
+        self.last_hist_sim_time = -1.0
+        
+        # Controlled perturbation state
+        self.perturbation_pct = 2.0 # Default 2%
+        self.last_perturbation_str = "None (Initial State)"
+        
+        # Interactive test planet injection state
+        self.inject_a0 = 1.00
+        self.inject_e0 = 0.00
+        self.e0_test = 0.00
         
         # Initialize the scenario
         self.load_preset(preset_id, custom_test_orbit)
@@ -558,6 +617,18 @@ class AstrophysicsEngine:
         self.stability_state = "STABLE"
         self.phi_history = []
         self.resonance_state = "INSUFFICIENT DATA (Collecting orbital cycles)"
+        
+        self.e_history_t.clear()
+        self.e_history_val.clear()
+        self.phi_plot_t.clear()
+        self.phi_plot_val.clear()
+        self.last_hist_sim_time = -1.0
+        if custom_test_orbit is not None:
+            self.e0_test = float(custom_test_orbit[1])
+            self.inject_a0 = float(custom_test_orbit[0])
+            self.inject_e0 = float(custom_test_orbit[1])
+        else:
+            self.e0_test = 0.00
         
         bodies, desc, res_label = get_scenario_bodies(preset_id, custom_test_orbit)
         self.scenario_description = desc
@@ -654,6 +725,13 @@ class AstrophysicsEngine:
             
         # Initial diagnostic evaluation
         self._update_diagnostics()
+        
+        # Record initial t=0 sample
+        self.e_history_t.append(self.time_sim)
+        self.e_history_val.append(self.e_test)
+        if self.num_active >= 4:
+            self.phi_plot_t.append(self.time_sim)
+            self.phi_plot_val.append(self.phi_3_1_deg)
 
     def step_simulation(self):
         """Advances the simulation by self.substeps integration substeps."""
@@ -693,6 +771,24 @@ class AstrophysicsEngine:
             
         # Update diagnostics using pos_all, vel_all
         self._update_diagnostics(pos_all, vel_all)
+
+        # Record rolling live histories for e(t) and phi(t) at ~60 samples/yr
+        if self.time_sim - self.last_hist_sim_time >= 0.015:
+            self.last_hist_sim_time = self.time_sim
+            self.e_history_t.append(self.time_sim)
+            self.e_history_val.append(self.e_test)
+            if self.num_active >= 4:
+                self.phi_plot_t.append(self.time_sim)
+                self.phi_plot_val.append(self.phi_3_1_deg)
+
+            # Prune points older than e_history_window in O(1) time
+            cutoff_t = self.time_sim - self.e_history_window
+            while len(self.e_history_t) > 1 and self.e_history_t[0] < cutoff_t:
+                self.e_history_t.popleft()
+                self.e_history_val.popleft()
+            while len(self.phi_plot_t) > 1 and self.phi_plot_t[0] < cutoff_t:
+                self.phi_plot_t.popleft()
+                self.phi_plot_val.popleft()
 
     def _record_trail_snapshot(self, pos_all=None):
         """Buffers current body positions into historical trail arrays."""
@@ -931,6 +1027,62 @@ class AstrophysicsEngine:
         else:
             self.stability_state = "STABLE"
 
+    def apply_velocity_perturbation(self, pct: float = 2.0):
+        """
+        Applies a controlled tangential velocity impulse to the test planet.
+        Delta-v = (pct / 100.0) * v_rel(test wrt Star A).
+        Does NOT teleport the planet or modify its position.
+        """
+        test_idx = self.num_active - 1
+        p_test = pos[test_idx].to_numpy()
+        v_test = vel[test_idx].to_numpy()
+        p_star = pos[0].to_numpy()
+        v_star = vel[0].to_numpy()
+        
+        v_rel = v_test - v_star
+        v_speed = float(np.linalg.norm(v_rel))
+        if v_speed > 1e-6:
+            delta_v = (pct / 100.0) * v_rel
+            new_v = v_test + delta_v
+            vel[test_idx] = [float(new_v[0]), float(new_v[1])]
+            
+            delta_v_mag = float(np.linalg.norm(delta_v))
+            self.last_perturbation_str = f"+{pct:.1f}% tangential impulse ({delta_v_mag:.4f} AU/yr, {delta_v_mag * 4.74:.1f} km/s) at t = {self.time_sim:.2f} yr"
+            
+            # Update diagnostics immediately in this frame
+            compute_accelerations_kernel()
+            compute_conservation_metrics_kernel()
+            pos_all = pos.to_numpy()
+            vel_all = vel.to_numpy()
+            self._update_diagnostics(pos_all, vel_all)
+            
+            # Add point to history immediately so step response is visible
+            self.e_history_t.append(self.time_sim)
+            self.e_history_val.append(self.e_test)
+            if self.num_active >= 4:
+                self.phi_plot_t.append(self.time_sim)
+                self.phi_plot_val.append(self.phi_3_1_deg)
+
+    def reset_experiment(self):
+        """
+        Restores the currently selected preset and custom orbit to initial state
+        and clears diagnostic histories.
+        """
+        self.last_perturbation_str = "None (Experiment Reset)"
+        self.load_preset(self.preset_id, self.custom_test_orbit)
+
+    def inject_test_planet(self, a0: float, e0: float):
+        """
+        Initializes test planet with selected initial semimajor axis a0 and eccentricity e0.
+        Constructs initial velocity consistently at periapsis with Keplerian velocity.
+        Identical to the stability map scanner initialization.
+        """
+        self.custom_test_orbit = (float(a0), float(e0))
+        self.inject_a0 = float(a0)
+        self.inject_e0 = float(e0)
+        self.last_perturbation_str = f"Injected orbit a0={a0:.2f} AU, e0={e0:.2f} at t=0.0 yr"
+        self.load_preset(self.preset_id, self.custom_test_orbit)
+
 # ==============================================================================
 # 7. STABILITY MAP SCANNER (HEADLESS N-BODY EXPERIMENT)
 # ==============================================================================
@@ -1126,8 +1278,21 @@ class SimulationRenderer:
         self.map_radii_np = np.zeros(MAX_MAP_POINTS, dtype=np.float32)
         self.map_axis_verts_np = np.zeros((128, 2), dtype=np.float32)
         self.map_axis_cols_np = np.zeros((128, 3), dtype=np.float32)
-        self.glow_radii_np = np.zeros(2, dtype=np.float32)
-        self.glow_colors_np = np.zeros((2, 3), dtype=np.float32)
+
+        # Preallocated buffers for live plots
+        self.plot_e_verts_np = np.zeros((MAX_PLOT_VERTS, 2), dtype=np.float32)
+        self.plot_e_cols_np = np.zeros((MAX_PLOT_VERTS, 3), dtype=np.float32)
+        self.plot_phi_verts_np = np.zeros((MAX_PLOT_VERTS, 2), dtype=np.float32)
+        self.plot_phi_cols_np = np.zeros((MAX_PLOT_VERTS, 3), dtype=np.float32)
+        self.plot_dot_centers_np = np.zeros((4, 2), dtype=np.float32)
+        self.plot_dot_cols_np = np.zeros((4, 3), dtype=np.float32)
+        self.plot_dot_radii_np = np.zeros(4, dtype=np.float32)
+
+        # Throttle live plot GPU buffer updates to 10 Hz (approx 8-12 Hz target)
+        self.last_plot_update_time = 0.0
+        self.plot_update_interval = 0.10 # 10 Hz
+        self.last_ring_params = None
+        self.body_style_dirty = True
 
     def render_frame(self):
         eng = self.engine
@@ -1165,73 +1330,81 @@ class SimulationRenderer:
 
         # 1. Habitable Zone Annulus & Snow Line Rings (centered on Star A)
         star_a_x, star_a_y = pos[0][0], pos[0][1]
-        hz_in = eng.hz_inner_au
-        hz_out = eng.hz_outer_au
-        snow = eng.snow_line_au
-        
-        r_indices = [
-            (hz_in, (0.15, 0.65, 0.40)),  # Emerald (HZ Inner)
-            (hz_out, (0.10, 0.55, 0.35)), # Forest green (HZ Outer)
-            (snow, (0.30, 0.55, 0.85)),   # Cyan frost (Snow Line)
-        ]
-        
-        ring_v_idx = 0
-        for radius_au, ring_col in r_indices:
-            for s in range(RING_SEGMENTS):
-                ang1 = (s / RING_SEGMENTS) * TWO_PI
-                ang2 = ((s + 1) / RING_SEGMENTS) * TWO_PI
-                
-                x1 = star_a_x + radius_au * math.cos(ang1)
-                y1 = star_a_y + radius_au * math.sin(ang1)
-                x2 = star_a_x + radius_au * math.cos(ang2)
-                y2 = star_a_y + radius_au * math.sin(ang2)
-                
-                sx1, sy1 = au_to_canvas(x1, y1)
-                sx2, sy2 = au_to_canvas(x2, y2)
-                
-                self.ring_verts_np[ring_v_idx] = [sx1, sy1]
-                self.ring_cols_np[ring_v_idx] = ring_col
-                ring_v_idx += 1
-                
-                self.ring_verts_np[ring_v_idx] = [sx2, sy2]
-                self.ring_cols_np[ring_v_idx] = ring_col
-                ring_v_idx += 1
+        ring_params = (round(star_a_x, 3), round(star_a_y, 3), round(scale_au, 2), round(cx, 3), round(cy, 3), eng.preset_id)
+        if self.last_ring_params != ring_params:
+            self.last_ring_params = ring_params
+            hz_in = eng.hz_inner_au
+            hz_out = eng.hz_outer_au
+            snow = eng.snow_line_au
+            
+            r_indices = [
+                (hz_in, (0.15, 0.65, 0.40)),  # Emerald (HZ Inner)
+                (hz_out, (0.10, 0.55, 0.35)), # Forest green (HZ Outer)
+                (snow, (0.30, 0.55, 0.85)),   # Cyan frost (Snow Line)
+            ]
+            
+            ring_v_idx = 0
+            for radius_au, ring_col in r_indices:
+                for s in range(RING_SEGMENTS):
+                    ang1 = (s / RING_SEGMENTS) * TWO_PI
+                    ang2 = ((s + 1) / RING_SEGMENTS) * TWO_PI
+                    
+                    x1 = star_a_x + radius_au * math.cos(ang1)
+                    y1 = star_a_y + radius_au * math.sin(ang1)
+                    x2 = star_a_x + radius_au * math.cos(ang2)
+                    y2 = star_a_y + radius_au * math.sin(ang2)
+                    
+                    sx1, sy1 = au_to_canvas(x1, y1)
+                    sx2, sy2 = au_to_canvas(x2, y2)
+                    
+                    self.ring_verts_np[ring_v_idx] = [sx1, sy1]
+                    self.ring_cols_np[ring_v_idx] = ring_col
+                    ring_v_idx += 1
+                    
+                    self.ring_verts_np[ring_v_idx] = [sx2, sy2]
+                    self.ring_cols_np[ring_v_idx] = ring_col
+                    ring_v_idx += 1
 
-        ring_vertices.from_numpy(self.ring_verts_np)
-        ring_colors.from_numpy(self.ring_cols_np)
+            ring_vertices.from_numpy(self.ring_verts_np)
+            ring_colors.from_numpy(self.ring_cols_np)
+
         self.canvas.lines(ring_vertices, width=0.0015, per_vertex_color=ring_colors)
 
-        # 2. Historical Orbital Trajectories (True numerical integration paths)
+        # 2. Historical Orbital Trajectories (Vectorized NumPy generation)
         trail_v_idx = 0
-        self.trail_verts_np.fill(0.0)
-        self.trail_cols_np.fill(0.0)
-        
+        scale_2 = scale_au * 2.0
         for i in range(eng.num_active):
             cnt = eng.trail_counts[i]
             if cnt > 1:
-                col = [color[i][0] * 0.7, color[i][1] * 0.7, color[i][2] * 0.7]
                 head = eng.trail_head[i]
+                if cnt < TRAIL_LENGTH:
+                    pts = eng.trail_history[i, :cnt]
+                else:
+                    pts = np.concatenate((eng.trail_history[i, head:], eng.trail_history[i, :head]))
                 
-                for k in range(cnt - 1):
-                    idx1 = (head - cnt + k) % TRAIL_LENGTH
-                    idx2 = (head - cnt + k + 1) % TRAIL_LENGTH
-                    
-                    p1 = eng.trail_history[i, idx1]
-                    p2 = eng.trail_history[i, idx2]
-                    
-                    sx1, sy1 = au_to_canvas(p1[0], p1[1])
-                    sx2, sy2 = au_to_canvas(p2[0], p2[1])
-                    
-                    alpha = 0.2 + 0.8 * (k / float(cnt))
-                    v_col = [col[0] * alpha, col[1] * alpha, col[2] * alpha]
-                    
-                    self.trail_verts_np[trail_v_idx] = [sx1, sy1]
-                    self.trail_cols_np[trail_v_idx] = v_col
-                    trail_v_idx += 1
-                    
-                    self.trail_verts_np[trail_v_idx] = [sx2, sy2]
-                    self.trail_cols_np[trail_v_idx] = v_col
-                    trail_v_idx += 1
+                sx = 0.5 + ((pts[:, 0] - cx) / scale_2) * self.aspect_ratio
+                sy = 0.5 + ((pts[:, 1] - cy) / scale_2)
+                n_segs = cnt - 1
+                n_verts = n_segs * 2
+                
+                target_v = self.trail_verts_np[trail_v_idx : trail_v_idx + n_verts]
+                target_v[0::2, 0] = sx[:-1]
+                target_v[0::2, 1] = sy[:-1]
+                target_v[1::2, 0] = sx[1:]
+                target_v[1::2, 1] = sy[1:]
+                
+                base_col = np.array(color[i], dtype=np.float32) * 0.7
+                alphas = np.linspace(0.2, 1.0, n_segs, dtype=np.float32)
+                cols = alphas[:, None] * base_col
+                target_c = self.trail_cols_np[trail_v_idx : trail_v_idx + n_verts]
+                target_c[0::2] = cols
+                target_c[1::2] = cols
+                
+                trail_v_idx += n_verts
+                
+        if trail_v_idx < MAX_TRAIL_VERTICES:
+            self.trail_verts_np[trail_v_idx:].fill(0.0)
+            self.trail_cols_np[trail_v_idx:].fill(0.0)
 
         if trail_v_idx > 0:
             trail_vertices.from_numpy(self.trail_verts_np)
@@ -1244,39 +1417,297 @@ class SimulationRenderer:
             sx, sy = au_to_canvas(px, py)
             self.draw_centers_np[i] = [sx, sy]
 
-        # Outer glowing corona for stars
         self.glow_centers_np[0] = self.draw_centers_np[0]
-        self.glow_radii_np[0] = 0.024
-        self.glow_colors_np[0] = [1.0, 0.82, 0.35]
-        
         if eng.num_active > 1 and active[1] == 1 and mass[1] > 0.05:
             self.glow_centers_np[1] = self.draw_centers_np[1]
-            self.glow_radii_np[1] = 0.017
-            self.glow_colors_np[1] = [1.0, 0.45, 0.25]
         else:
             self.glow_centers_np[1] = [2.0, 2.0]
-            self.glow_radii_np[1] = 0.0
-            self.glow_colors_np[1] = [0.0, 0.0, 0.0]
+
+        if self.body_style_dirty:
+            self.glow_radii_np[0] = 0.024
+            self.glow_colors_np[0] = [1.0, 0.82, 0.35]
+            if eng.num_active > 1 and active[1] == 1 and mass[1] > 0.05:
+                self.glow_radii_np[1] = 0.017
+                self.glow_colors_np[1] = [1.0, 0.45, 0.25]
+            else:
+                self.glow_radii_np[1] = 0.0
+                self.glow_colors_np[1] = [0.0, 0.0, 0.0]
+
+            for i in range(MAX_BODIES):
+                if i < eng.num_active and active[i] == 1:
+                    self.draw_radii_np[i] = 0.012 if i == 0 else (0.009 if i == 1 and mass[1] > 0.05 else (0.007 if i == 2 and eng.num_active >= 4 else 0.0055))
+                    self.draw_colors_np[i] = [color[i][0], color[i][1], color[i][2]]
+                else:
+                    self.draw_radii_np[i] = 0.0
+                    self.draw_colors_np[i] = [0.0, 0.0, 0.0]
+
+            draw_glow_radii.from_numpy(self.glow_radii_np)
+            draw_glow_colors.from_numpy(self.glow_colors_np)
+            draw_radii.from_numpy(self.draw_radii_np)
+            draw_colors.from_numpy(self.draw_colors_np)
+            self.body_style_dirty = False
 
         draw_glow_centers.from_numpy(self.glow_centers_np)
-        draw_glow_radii.from_numpy(self.glow_radii_np)
-        draw_glow_colors.from_numpy(self.glow_colors_np)
         self.canvas.circles(draw_glow_centers, radius=0.020, per_vertex_color=draw_glow_colors, per_vertex_radius=draw_glow_radii)
 
-        # Individual celestial body cores
-        for i in range(MAX_BODIES):
-            if i < eng.num_active and active[i] == 1:
-                self.draw_radii_np[i] = 0.012 if i == 0 else (0.009 if i == 1 and mass[1] > 0.05 else (0.007 if i == 2 and eng.num_active >= 4 else 0.0055))
-                self.draw_colors_np[i] = [color[i][0], color[i][1], color[i][2]]
-            else:
-                self.draw_centers_np[i] = [2.0, 2.0]
-                self.draw_radii_np[i] = 0.0
-                self.draw_colors_np[i] = [0.0, 0.0, 0.0]
-
         draw_centers.from_numpy(self.draw_centers_np)
-        draw_radii.from_numpy(self.draw_radii_np)
-        draw_colors.from_numpy(self.draw_colors_np)
         self.canvas.circles(draw_centers, radius=0.006, per_vertex_color=draw_colors, per_vertex_radius=draw_radii)
+
+        # 4. Live Scientific Plots (Osculating Eccentricity History & 3:1 Resonant Angle)
+        now = time.time()
+        update_plots = (now - self.last_plot_update_time) >= self.plot_update_interval
+        if update_plots:
+            self.last_plot_update_time = now
+
+        self._render_live_eccentricity_plot(update_data=update_plots)
+        if eng.num_active >= 4:
+            self._render_live_resonance_plot(update_data=update_plots)
+
+    def _render_live_eccentricity_plot(self, update_data: bool = True):
+        """
+        Renders compact scientific plot of osculating eccentricity e(t) on canvas.
+        Throttles vertex recomputation and GPU uploads to ~10 Hz; renders from VRAM on intervening frames.
+        Viewport: X in [0.68, 0.98], Y in [0.54, 0.84] (Height 0.30, Width 0.30).
+        """
+        eng = self.engine
+        x_min, x_max = 0.68, 0.98
+        y_min, y_max = 0.54, 0.84
+        dx = x_max - x_min
+        dy = y_max - y_min
+        
+        if update_data:
+            v_idx = 0
+            box_col = [0.28, 0.35, 0.48]
+            
+            # 1. Bounding Box (4 line segments = 8 vertices)
+            self.plot_e_verts_np[v_idx] = [x_min, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_max, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_e_verts_np[v_idx] = [x_max, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_max, y_max]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_e_verts_np[v_idx] = [x_max, y_max]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_min, y_max]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_e_verts_np[v_idx] = [x_min, y_max]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_min, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            
+            # 2. Horizontal Reference Threshold Lines (Adaptive vertical scale)
+            max_e_seen = max(eng.e_history_val) if len(eng.e_history_val) > 0 else eng.e_test
+            if max_e_seen < 0.01:
+                e_axis_max = 0.01
+                tick_vals = [0.005, 0.01]
+            elif max_e_seen < 0.05:
+                e_axis_max = 0.05
+                tick_vals = [0.01, 0.025, 0.05]
+            else:
+                e_axis_max = max(0.80, min(1.20, max_e_seen * 1.1))
+                tick_vals = []
+            
+            # e = 0.00 baseline tick
+            self.plot_e_verts_np[v_idx] = [x_min, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_min - 0.012, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_max, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_e_verts_np[v_idx] = [x_max + 0.012, y_min]; self.plot_e_cols_np[v_idx] = box_col; v_idx += 1
+
+            # Intermediate ticks for low-e zoom
+            tick_col = [0.22, 0.30, 0.42]
+            for tv in tick_vals:
+                ty = y_min + (tv / e_axis_max) * dy
+                self.plot_e_verts_np[v_idx] = [x_min, ty]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_min - 0.010, ty]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max, ty]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max + 0.010, ty]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+            
+            # e = 0.20 threshold (PERTURBED - Amber)
+            if 0.20 <= e_axis_max:
+                y_pert = y_min + (0.20 / e_axis_max) * dy
+                pert_col = [0.85, 0.70, 0.18]
+                self.plot_e_verts_np[v_idx] = [x_min, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                # Left and Right axis ticks
+                self.plot_e_verts_np[v_idx] = [x_min, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_min - 0.012, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max + 0.012, y_pert]; self.plot_e_cols_np[v_idx] = pert_col; v_idx += 1
+                
+            # e = 0.70 threshold (UNSTABLE - Orange/Red)
+            if 0.70 <= e_axis_max:
+                y_unst = y_min + (0.70 / e_axis_max) * dy
+                unst_col = [0.90, 0.38, 0.15]
+                self.plot_e_verts_np[v_idx] = [x_min, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                # Left and Right axis ticks
+                self.plot_e_verts_np[v_idx] = [x_min, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_min - 0.012, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [x_max + 0.012, y_unst]; self.plot_e_cols_np[v_idx] = unst_col; v_idx += 1
+                
+            # 3. Vertical Time Tick Lines (4 divisions across rolling window)
+            t_end = eng.time_sim
+            t_start = max(0.0, t_end - eng.e_history_window)
+            dt_window = max(eng.e_history_window, 1e-4)
+            
+            tick_col = [0.18, 0.24, 0.35]
+            for k in range(1, 4):
+                frac = k / 4.0
+                tx = x_min + frac * dx
+                self.plot_e_verts_np[v_idx] = [tx, y_min]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+                self.plot_e_verts_np[v_idx] = [tx, y_max]; self.plot_e_cols_np[v_idx] = tick_col; v_idx += 1
+
+            # 4. Live e(t) Trajectory Segments
+            n_pts = len(eng.e_history_t)
+            dot_x, dot_y = x_min, y_min
+            if n_pts >= 2:
+                curve_col = [0.20, 0.85, 1.0] # Vibrant cyan
+                for i in range(n_pts - 1):
+                    t1, e1 = eng.e_history_t[i], eng.e_history_val[i]
+                    t2, e2 = eng.e_history_t[i + 1], eng.e_history_val[i + 1]
+                    
+                    sx1 = x_min + ((t1 - t_start) / dt_window) * dx
+                    sy1 = y_min + (min(e1, e_axis_max) / e_axis_max) * dy
+                    sx2 = x_min + ((t2 - t_start) / dt_window) * dx
+                    sy2 = y_min + (min(e2, e_axis_max) / e_axis_max) * dy
+                    
+                    sx1 = max(x_min, min(x_max, sx1))
+                    sx2 = max(x_min, min(x_max, sx2))
+                    sy1 = max(y_min, min(y_max, sy1))
+                    sy2 = max(y_min, min(y_max, sy2))
+                    
+                    if v_idx + 2 < MAX_PLOT_VERTS:
+                        self.plot_e_verts_np[v_idx] = [sx1, sy1]; self.plot_e_cols_np[v_idx] = curve_col; v_idx += 1
+                        self.plot_e_verts_np[v_idx] = [sx2, sy2]; self.plot_e_cols_np[v_idx] = curve_col; v_idx += 1
+                        
+                dot_x = max(x_min, min(x_max, sx2))
+                dot_y = max(y_min, min(y_max, sy2))
+            elif n_pts == 1:
+                dot_x = x_min
+                dot_y = y_min + (min(eng.e_history_val[0], e_axis_max) / e_axis_max) * dy
+
+            # Clear remaining vertices
+            self.plot_e_verts_np[v_idx:].fill(0.0)
+            self.plot_e_cols_np[v_idx:].fill(0.0)
+            
+            plot_e_verts.from_numpy(self.plot_e_verts_np)
+            plot_e_cols.from_numpy(self.plot_e_cols_np)
+            
+            # Current point indicator dot on plot
+            self.plot_dot_centers_np[0] = [dot_x, dot_y]
+            self.plot_dot_cols_np[0] = [1.0, 0.95, 0.40] # Golden yellow dot
+            self.plot_dot_radii_np[0] = 0.0055
+            plot_dot_centers.from_numpy(self.plot_dot_centers_np)
+            plot_dot_colors.from_numpy(self.plot_dot_cols_np)
+            plot_dot_radii.from_numpy(self.plot_dot_radii_np)
+
+        self.canvas.lines(plot_e_verts, width=0.002, per_vertex_color=plot_e_cols)
+        self.canvas.circles(plot_dot_centers, radius=0.0055, per_vertex_color=plot_dot_colors, per_vertex_radius=plot_dot_radii)
+
+    def _render_live_resonance_plot(self, update_data: bool = True):
+        """
+        Renders compact rolling resonant angle plot phi(t) on canvas.
+        Throttles vertex recomputation and GPU uploads to ~10 Hz; renders from VRAM on intervening frames.
+        Viewport: X in [0.68, 0.98], Y in [0.12, 0.40] (Height 0.28, Width 0.30).
+        Vertical axis: [-180°, +180°].
+        """
+        eng = self.engine
+        x_min, x_max = 0.68, 0.98
+        y_min, y_max = 0.12, 0.40
+        dx = x_max - x_min
+        dy = y_max - y_min
+        
+        if update_data:
+            v_idx = 0
+            box_col = [0.28, 0.35, 0.48]
+            
+            # 1. Bounding Box (4 line segments = 8 vertices)
+            self.plot_phi_verts_np[v_idx] = [x_min, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_phi_verts_np[v_idx] = [x_max, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_phi_verts_np[v_idx] = [x_max, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_min, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_phi_verts_np[v_idx] = [x_min, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_min, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            # 2. Horizontal Reference Lines (phi = 0° center line, and +/-180° bounds)
+            mid_y = 0.5 * (y_min + y_max)
+            zero_col = [0.22, 0.55, 0.75] # Dim cyan zero line
+            self.plot_phi_verts_np[v_idx] = [x_min, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            
+            # Y-axis ticks for -180, 0, +180 on both sides
+            self.plot_phi_verts_np[v_idx] = [x_min, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_min - 0.012, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max + 0.012, y_min]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            self.plot_phi_verts_np[v_idx] = [x_min, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_min - 0.012, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max + 0.012, mid_y]; self.plot_phi_cols_np[v_idx] = zero_col; v_idx += 1
+            
+            self.plot_phi_verts_np[v_idx] = [x_min, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_min - 0.012, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            self.plot_phi_verts_np[v_idx] = [x_max + 0.012, y_max]; self.plot_phi_cols_np[v_idx] = box_col; v_idx += 1
+            
+            # 3. Vertical Time Ticks
+            t_end = eng.time_sim
+            t_start = max(0.0, t_end - eng.e_history_window)
+            dt_window = max(eng.e_history_window, 1e-4)
+            
+            tick_col = [0.18, 0.24, 0.35]
+            for k in range(1, 4):
+                frac = k / 4.0
+                tx = x_min + frac * dx
+                self.plot_phi_verts_np[v_idx] = [tx, y_min]; self.plot_phi_cols_np[v_idx] = tick_col; v_idx += 1
+                self.plot_phi_verts_np[v_idx] = [tx, y_max]; self.plot_phi_cols_np[v_idx] = tick_col; v_idx += 1
+
+            # 4. Live phi(t) Trajectory Segments
+            n_pts = len(eng.phi_plot_t)
+            dot_x, dot_y = x_min, mid_y
+            if n_pts >= 2:
+                curve_col = [0.85, 0.40, 0.95] # Magenta / violet for resonance angle
+                for i in range(n_pts - 1):
+                    t1, p1 = eng.phi_plot_t[i], eng.phi_plot_val[i]
+                    t2, p2 = eng.phi_plot_t[i + 1], eng.phi_plot_val[i + 1]
+                    
+                    sy1 = mid_y + (p1 / 180.0) * (0.5 * dy)
+                    sy2 = mid_y + (p2 / 180.0) * (0.5 * dy)
+                    sx1 = x_min + ((t1 - t_start) / dt_window) * dx
+                    sx2 = x_min + ((t2 - t_start) / dt_window) * dx
+                    
+                    if abs(p2 - p1) < 240.0:
+                        if v_idx + 2 < MAX_PLOT_VERTS:
+                            self.plot_phi_verts_np[v_idx] = [sx1, sy1]; self.plot_phi_cols_np[v_idx] = curve_col; v_idx += 1
+                            self.plot_phi_verts_np[v_idx] = [sx2, sy2]; self.plot_phi_cols_np[v_idx] = curve_col; v_idx += 1
+                            
+                dot_x = max(x_min, min(x_max, sx2))
+                dot_y = max(y_min, min(y_max, sy2))
+            elif n_pts == 1:
+                dot_x = x_min
+                dot_y = mid_y + (eng.phi_plot_val[0] / 180.0) * (0.5 * dy)
+
+            # Clear remaining vertices
+            self.plot_phi_verts_np[v_idx:].fill(0.0)
+            self.plot_phi_cols_np[v_idx:].fill(0.0)
+            
+            plot_phi_verts.from_numpy(self.plot_phi_verts_np)
+            plot_phi_cols.from_numpy(self.plot_phi_cols_np)
+            
+            # Current point marker
+            self.plot_dot_centers_np[1] = [dot_x, dot_y]
+            self.plot_dot_cols_np[1] = [1.0, 0.40, 1.0] # Magenta dot
+            self.plot_dot_radii_np[1] = 0.0055
+            plot_dot_centers.from_numpy(self.plot_dot_centers_np)
+            plot_dot_colors.from_numpy(self.plot_dot_cols_np)
+            plot_dot_radii.from_numpy(self.plot_dot_radii_np)
+
+        self.canvas.lines(plot_phi_verts, width=0.002, per_vertex_color=plot_phi_cols)
+        self.canvas.circles(plot_dot_centers, radius=0.0055, per_vertex_color=plot_dot_colors, per_vertex_radius=plot_dot_radii)
 
     def _render_stability_map_view(self):
         """Renders the (a0, e0) parameter space stability map with 3:1 resonance line."""
@@ -1441,15 +1872,41 @@ class SimulationRenderer:
                 gui.text("  or run 'python sim.py --scan'.")
         else:
             # ------------------------------------------------------------------
-            # ORBIT SIMULATION DASHBOARD (Existing 8 Panels)
+            # ORBIT SIMULATION DASHBOARD (Compact No-Scroll Scientific Layout)
             # ------------------------------------------------------------------
-            status_text = f"Simulation Clock: {eng.time_sim:.2f} yr | {'[PAUSED]' if eng.paused else '[RUNNING]'}"
+            preset_names = {
+                1: "S-Type Binary (Calm HZ)",
+                2: "Nominal 3:1 MMR (Resonance)",
+                3: "Tight Binary Intruder",
+                4: "Kepler 3rd Law Benchmark",
+            }
+            p_name = preset_names.get(eng.preset_id, f"Scenario {eng.preset_id}")
+            gui.text(f"ACTIVE SCENARIO: Preset {eng.preset_id} -- {p_name}")
+            status_text = f"Clock: {eng.time_sim:.2f} yr | {'[PAUSED]' if eng.paused else '[RUNNING]'}"
             gui.text(status_text)
-            
-            # System Architecture
             gui.text("----------------------------------------")
-            gui.text("1. SYSTEM ARCHITECTURE")
-            gui.text(f"Preset [{eng.preset_id}]: {eng.target_resonance_label}")
+            
+            # 1. DYNAMICAL STATE
+            gui.text("=== DYNAMICAL STATE ===")
+            gui.text(f"State: [{eng.stability_state}] | Flux: {eng.total_flux_test:.2f} S_sun ({eng.flux_status})")
+            da_a0 = (eng.a_test - eng.a0_test) / eng.a0_test if eng.a0_test > 0 else 0.0
+            if eng.num_active >= 4:
+                gui.text(f"e: {eng.e_test:.4f} | Sep: {eng.hill_sep:.2f} R_H | da/a0: {da_a0:+.2%}")
+            else:
+                gui.text(f"e: {eng.e_test:.4f} | da/a0: {da_a0:+.2%}")
+            gui.text(f"Survival Time: {eng.survival_time:.2f} yr")
+            gui.text("----------------------------------------")
+
+            # 2. EXPERIMENT CONTROLS
+            gui.text("=== EXPERIMENT CONTROLS ===")
+            eng.perturbation_pct = gui.slider_float("Impulse (%)", eng.perturbation_pct, 0.0, 5.0)
+            if gui.button("APPLY VELOCITY PERTURBATION"):
+                eng.apply_velocity_perturbation(eng.perturbation_pct)
+            gui.text(f"  {eng.last_perturbation_str}")
+            if gui.button("RESET EXPERIMENT"):
+                eng.reset_experiment()
+                
+            gui.text("Presets:")
             if gui.button("Preset 1: S-Type Binary (Calm HZ)"):
                 eng.load_preset(1)
             if gui.button("Preset 2: Nominal 3:1 MMR (Resonance)"):
@@ -1458,89 +1915,95 @@ class SimulationRenderer:
                 eng.load_preset(3)
             if gui.button("Preset 4: Kepler 3rd Law Benchmark"):
                 eng.load_preset(4)
-
-            # Numerical Fidelity & Conservation
             gui.text("----------------------------------------")
-            gui.text("2. NUMERICAL CONSERVATION (Symplectic)")
-            gui.text(f"Substeps/frame: {eng.substeps} | dt: {eng.dt_sub:.5f} yr")
-            gui.text(f"Energy Drift dE/E0:     {eng.delta_e_rel:+.3e}")
-            gui.text(f"Ang. Momentum dLz/Lz0:  {eng.delta_lz_rel:+.3e}")
-            gui.text(f"Softening eps: {DEFAULT_EPSILON:.3f} AU (r < eps unphysical)")
-            
-            # Test Planet Raw Orbital Diagnostics
-            gui.text("----------------------------------------")
-            gui.text("3. TEST PLANET ORBITAL DIAGNOSTICS")
-            gui.text("(Osculating 2-body elements relative to Star A)")
-            gui.text(f"Instantaneous dist r:   {eng.r_test:.4f} AU")
-            gui.text(f"Orbital speed v:        {eng.v_test:.4f} AU/yr ({eng.v_test * 4.74:.1f} km/s)")
-            gui.text(f"Osculating semimajor a: {eng.a_test:.4f} AU")
-            da_a0 = (eng.a_test - eng.a0_test) / eng.a0_test if eng.a0_test > 0 else 0.0
-            gui.text(f"Semimajor drift da/a0:  {da_a0:+.3%}")
-            gui.text(f"Osculating ecc e(t):    {eng.e_test:.4f}")
-            gui.text(f"Periapsis / Apoapsis:   {eng.peri_test:.3f} / {eng.apo_test:.3f} AU")
-            gui.text(f"Barycentric Energy:     {eng.bary_energy_test:+.4f} AU^2/yr^2")
 
-            # Resonance Diagnostics (3:1 MMR)
+            # 3. INJECTION (Test Planet)
+            gui.text("=== INJECTION (Test Planet) ===")
+            eng.inject_a0 = gui.slider_float("Inject a0 (AU)", eng.inject_a0, 0.70, 1.50)
+            eng.inject_e0 = gui.slider_float("Inject e0", eng.inject_e0, 0.00, 0.40)
+            if gui.button("LOAD SELECTED ORBIT"):
+                eng.inject_test_planet(eng.inject_a0, eng.inject_e0)
+            gui.text(f"  Init: a0={eng.a0_test:.3f}, e0={eng.e0_test:.3f} | Curr: a={eng.a_test:.3f}, e={eng.e_test:.3f}")
+            gui.text("----------------------------------------")
+
+            # 4. LIVE DYNAMICS
+            gui.text("=== LIVE DYNAMICS ===")
+            gui.text(f"a: {eng.a_test:.4f} AU | e: {eng.e_test:.4f} | v: {eng.v_test * 4.74:.1f} km/s")
+            gui.text(f"Peri: {eng.peri_test:.3f} AU | Apo: {eng.apo_test:.3f} AU")
+            gui.text(f"dE/E0: {eng.delta_e_rel:+.2e} | dLz/Lz0: {eng.delta_lz_rel:+.2e}")
+            if len(eng.measured_periods) > 0:
+                gui.text(f"Kepler P^2/a^3: {eng.kepler_ratio_p2_over_a3:.4f} (err: {eng.kepler_relative_error:.1f}%)")
+
+            # 5. RESONANCE
             if eng.num_active >= 4:
                 gui.text("----------------------------------------")
-                gui.text("4. 3:1 RESONANT ANGLE DIAGNOSTIC")
-                gui.text(f"Giant Semimajor a_J:    {eng.a_giant:.3f} AU (e = {eng.e_giant:.3f})")
-                gui.text(f"Semimajor Ratio a_J/a_t:{eng.a_ratio:.3f}")
-                gui.text(f"Period Ratio P_J/P_t:   {eng.period_ratio:.3f}")
-                gui.text(f"Resonant Angle phi:     {eng.phi_3_1_deg:.1f}° ({eng.phi_3_1:.3f} rad)")
-                gui.text(f"Resonance Classification:")
-                gui.text(f"  {eng.resonance_state}")
                 if eng.preset_id == 2:
-                    gui.text("  (phi = 3*lambda_J - lambda_t - 2*varpi_t)")
+                    gui.text("=== RESONANCE (3:1 MMR) ===")
+                    gui.text(f"a_J: {eng.a_giant:.3f} AU | P_J/P_t: {eng.period_ratio:.3f} | phi: {eng.phi_3_1_deg:+.1f} deg")
+                    if "LIBRATING" in eng.resonance_state:
+                        short_state = "LIBRATING"
+                    elif "CIRCULATING" in eng.resonance_state:
+                        short_state = "CIRCULATING"
+                    else:
+                        short_state = "INSUFFICIENT DATA"
+                    gui.text(f"State: [{short_state}] ({eng.resonance_state})")
+                else:
+                    gui.text("=== RESONANCE DIAGNOSTIC -- NOT 3:1 SETUP ===")
+                    gui.text(f"a_J: {eng.a_giant:.3f} AU | P_J/P_t: {eng.period_ratio:.3f} (Non-resonant)")
+                    gui.text("Note: Switch to Preset 2 for 3:1 MMR experiment")
 
-            # Stellar Insolation & Habitable Zone
+            # 6. SECONDARY ENGINE CONTROLS
             gui.text("----------------------------------------")
-            gui.text("5. STELLAR IRRADIATION & HZ")
-            gui.text(f"Star A Luminosity:      {eng.primary_luminosity:.3f} L_sun")
-            gui.text(f"Total Received Flux:    {eng.total_flux_test:.3f} S_sun")
-            gui.text(f"Approximate HZ Flux:    [0.53 - 1.11] S_sun")
-            gui.text(f"Radiative State:        {eng.flux_status}")
-            gui.text(f"Luminosity Snow Line:   {eng.snow_line_au:.2f} AU")
-            gui.text("(Simplified flux proxy; does not model climate)")
-
-            # Operational Stability Classification
-            gui.text("----------------------------------------")
-            gui.text("6. OPERATIONAL STABILITY CATEGORY")
-            gui.text(f"Classification:         [{eng.stability_state}]")
-            gui.text(f"Survival Time:          {eng.survival_time:.2f} yr")
-            if eng.num_active >= 4:
-                gui.text(f"Giant Hill Radius R_H:  {eng.r_hill_giant:.3f} AU")
-                gui.text(f"Current Separation:     {eng.hill_sep:.2f} R_H")
-            gui.text("(Operational categories based on Hill separation,")
-            gui.text(" not universal physical theorems.)")
-
-            # Kepler 3rd Law Validation Monitor
-            gui.text("----------------------------------------")
-            gui.text("7. EMPIRICAL KEPLER VALIDATION")
-            gui.text(f"Measured Revolutions:   {len(eng.measured_periods)}")
-            if len(eng.measured_periods) > 0:
-                last_p = eng.measured_periods[-1]
-                gui.text(f"Empirical Period P:     {last_p:.4f} yr")
-                gui.text(f"Kepler Ratio P^2/a^3:   {eng.kepler_ratio_p2_over_a3:.4f}")
-                gui.text(f"Kepler Error vs Theory: {eng.kepler_relative_error:.2f}%")
-            else:
-                gui.text("Accumulating full 2*pi revolution...")
-
-            # Interactive Controls
-            gui.text("----------------------------------------")
-            gui.text("8. INTERACTIVE CONTROLS")
+            gui.text("=== ENGINE & VIEW CONTROLS ===")
             if gui.button("Pause / Resume (SPACE)"):
                 eng.paused = not eng.paused
-            if gui.button("Reset Scenario (R)"):
-                eng.load_preset(eng.preset_id, eng.custom_test_orbit)
             if gui.button("Focus: " + ("Primary Star" if eng.view_focus == 0 else "Barycenter")):
                 eng.view_focus = 1 - eng.view_focus
-
-            eng.view_scale_au = gui.slider_float("View Scale (AU)", eng.view_scale_au, 1.0, 30.0)
-            eng.substeps = gui.slider_int("Substeps/frame", eng.substeps, 10, 400)
-            eng.dt_sub = gui.slider_float("dt step (yr)", eng.dt_sub, 0.00005, 0.001)
+            eng.view_scale_au = gui.slider_float("Zoom (AU)", eng.view_scale_au, 1.0, 30.0)
+            eng.substeps = gui.slider_int("Substeps", eng.substeps, 10, 400)
+            eng.dt_sub = gui.slider_float("dt step", eng.dt_sub, 0.00005, 0.001)
 
         gui.end()
+
+        # Dedicated Diagnostic Plots Header Windows
+        if self.view_mode == "ORBIT":
+            # 1. ECCENTRICITY HISTORY e(t) Header Window
+            gui.begin("ECCENTRICITY HISTORY e(t)", 0.68, 0.015, 0.305, 0.135)
+            t_start = max(0.0, eng.time_sim - eng.e_history_window)
+            max_e_val = max(eng.e_history_val) if len(eng.e_history_val) > 0 else eng.e_test
+            if max_e_val < 0.01:
+                y_axis_label = "Y-AXIS: [0.00 - 0.01] (Low-e Zoom)"
+            elif max_e_val < 0.05:
+                y_axis_label = "Y-AXIS: [0.00 - 0.05] (Low-e Zoom)"
+            else:
+                y_axis_label = "Y-AXIS: 0.00 | 0.20 [PERTURBED] | 0.70 [UNSTABLE]"
+            gui.text(f"e(t) = {eng.e_test:.4f}  (Max: {max_e_val:.4f})")
+            gui.text(y_axis_label)
+            gui.text(f"Status: [{eng.stability_state}] | t: [{t_start:.1f}, {eng.time_sim:.1f}] yr")
+            gui.end()
+
+            # 2. Resonance Header Window
+            if eng.num_active >= 4:
+                if eng.preset_id == 2:
+                    gui.begin("3:1 RESONANT ANGLE phi(t)", 0.68, 0.455, 0.305, 0.135)
+                    if "LIBRATING" in eng.resonance_state:
+                        short_state = "LIBRATING"
+                    elif "CIRCULATING" in eng.resonance_state:
+                        short_state = "CIRCULATING"
+                    else:
+                        short_state = "INSUFFICIENT DATA"
+                    gui.text(f"phi(t) = {eng.phi_3_1_deg:+.1f} deg | P_J/P_t = {eng.period_ratio:.3f}")
+                    gui.text("Y-AXIS: -180 deg | 0 deg | +180 deg")
+                    gui.text(f"Resonance State: [{short_state}]")
+                    gui.text(f"Details: {eng.resonance_state}")
+                    gui.end()
+                else:
+                    gui.begin("RESONANCE DIAGNOSTIC -- NOT 3:1 SETUP", 0.68, 0.455, 0.305, 0.135)
+                    gui.text(f"Preset {eng.preset_id}: Giant at a_J = {eng.a_giant:.3f} AU")
+                    gui.text(f"Period Ratio P_J/P_t = {eng.period_ratio:.3f} (Non-resonant)")
+                    gui.text("Y-AXIS: -180 deg | 0 deg | +180 deg")
+                    gui.text("Select Preset 2 for 3:1 MMR experiment")
+                    gui.end()
 
     def process_events(self):
         """Handles keyboard and GUI interaction events."""
