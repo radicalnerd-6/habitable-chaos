@@ -134,6 +134,16 @@ draw_glow_centers = ti.Vector.field(2, dtype=ti.f32, shape=2)  # For stars
 draw_glow_radii = ti.field(dtype=ti.f32, shape=2)
 draw_glow_colors = ti.Vector.field(3, dtype=ti.f32, shape=2)
 
+# Stability map rendering fields (up to 1000 points)
+MAX_MAP_POINTS = 1000
+map_point_centers = ti.Vector.field(2, dtype=ti.f32, shape=MAX_MAP_POINTS)
+map_point_colors = ti.Vector.field(3, dtype=ti.f32, shape=MAX_MAP_POINTS)
+map_point_radii = ti.field(dtype=ti.f32, shape=MAX_MAP_POINTS)
+
+# Stability map axes, ticks, and reference lines
+map_axis_vertices = ti.Vector.field(2, dtype=ti.f32, shape=128)
+map_axis_colors = ti.Vector.field(3, dtype=ti.f32, shape=128)
+
 # ==============================================================================
 # 4. TAICHI SYMPLECTIC INTEGRATION KERNELS
 # ==============================================================================
@@ -301,7 +311,7 @@ def compute_two_body_velocity(m1, m2, a, e=0.0):
     
     return r1, v1, r2, v2
 
-def get_scenario_bodies(preset_id: int):
+def get_scenario_bodies(preset_id: int, custom_test_orbit=None):
     """
     Builds scientifically rigorous initial configurations:
     1: S-Type Binary (Calm HZ Benchmark)
@@ -362,13 +372,22 @@ def get_scenario_bodies(preset_id: int):
         vel_giant = v_a + np.array([0.0, v_giant_rel], dtype=np.float32)
         bodies.append(BodyConfig("Giant Perturber (3:1 MMR)", m_giant, 0.016, (0.95, 0.65, 0.25), pos_giant, vel_giant))
         
-        # Test planet at 1.00 AU
+        # Test planet at 1.00 AU (or custom a0, e0 from Stability Map)
         m_test = 3.003e-6
-        a_test = 1.00
-        v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
-        pos_test = r_a + np.array([a_test, 0.0], dtype=np.float32)
-        vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
-        bodies.append(BodyConfig("Terrestrial Planet (Resonant Test)", m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
+        if custom_test_orbit is not None:
+            a_test, e_test = custom_test_orbit
+            r_peri = a_test * (1.0 - e_test)
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) * (1.0 + e_test) / max(r_peri, 1e-6))
+            pos_test = r_a + np.array([r_peri, 0.0], dtype=np.float32)
+            vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
+            label = f"Terrestrial Planet (a0={a_test:.2f}, e0={e_test:.2f})"
+        else:
+            a_test = 1.00
+            v_test_rel = math.sqrt(G_SIM * (m_a + m_test) / a_test)
+            pos_test = r_a + np.array([a_test, 0.0], dtype=np.float32)
+            vel_test = v_a + np.array([0.0, v_test_rel], dtype=np.float32)
+            label = "Terrestrial Planet (Resonant Test)"
+        bodies.append(BodyConfig(label, m_test, 0.010, (0.20, 0.85, 1.0), pos_test, vel_test))
 
     elif preset_id == 3:
         description = "Tight Binary Intruder: Companion at a = 5.2 AU (e = 0.30) causing strong gravitational scattering"
@@ -458,8 +477,9 @@ def compute_orbital_angles(r_rel, v_rel, mu):
     return varpi, M, mean_long, e
 
 class AstrophysicsEngine:
-    def __init__(self, preset_id=1):
+    def __init__(self, preset_id=1, custom_test_orbit=None):
         self.preset_id = preset_id
+        self.custom_test_orbit = custom_test_orbit
         self.time_sim = 0.0            # Elapsed simulation time in years
         self.paused = False
         
@@ -528,17 +548,18 @@ class AstrophysicsEngine:
         self.flux_status = "INSIDE APPROXIMATE HZ"
         
         # Initialize the scenario
-        self.load_preset(preset_id)
+        self.load_preset(preset_id, custom_test_orbit)
 
-    def load_preset(self, preset_id):
+    def load_preset(self, preset_id, custom_test_orbit=None):
         self.preset_id = preset_id
+        self.custom_test_orbit = custom_test_orbit
         self.time_sim = 0.0
         self.survival_time = 0.0
         self.stability_state = "STABLE"
         self.phi_history = []
         self.resonance_state = "INSUFFICIENT DATA (Collecting orbital cycles)"
         
-        bodies, desc, res_label = get_scenario_bodies(preset_id)
+        bodies, desc, res_label = get_scenario_bodies(preset_id, custom_test_orbit)
         self.scenario_description = desc
         self.target_resonance_label = res_label
         self.num_active = len(bodies)
@@ -911,7 +932,160 @@ class AstrophysicsEngine:
             self.stability_state = "STABLE"
 
 # ==============================================================================
-# 7. RENDERING SYSTEM & GGUI INTERACTION
+# 7. STABILITY MAP SCANNER (HEADLESS N-BODY EXPERIMENT)
+# ==============================================================================
+class StabilityMapScanner:
+    def __init__(self, a_range=(0.70, 1.50), e_range=(0.00, 0.40), n_a=40, n_e=25, t_duration=5.0, dt_sub=0.0002):
+        self.a_range = a_range
+        self.e_range = e_range
+        self.n_a = n_a
+        self.n_e = n_e
+        self.t_duration = t_duration
+        self.dt_sub = dt_sub
+        self.results = []
+        # Nominal 3:1 resonance: a_res = a_giant / (3^(2/3))
+        # For a_giant = 2.08008 AU -> a_res ~ 1.0000 AU
+        self.nominal_a_res = 2.08008 / math.pow(3.0, 2.0 / 3.0)
+        
+    def run_scan(self, progress_callback=None):
+        """
+        Performs headless N-body parameter scan across the (a0, e0) grid.
+        Integrates actual N-body equations using the verified Velocity Verlet GPU kernel.
+        """
+        a_vals = np.linspace(self.a_range[0], self.a_range[1], self.n_a)
+        e_vals = np.linspace(self.e_range[0], self.e_range[1], self.n_e)
+        total_points = self.n_a * self.n_e
+        
+        self.results = []
+        engine = AstrophysicsEngine(preset_id=2)
+        engine.dt_sub = self.dt_sub
+        
+        chunk_steps = 1000  # 0.2 yr per chunk (5 samples per orbit at 1 AU)
+        n_chunks = max(1, int(self.t_duration / (chunk_steps * self.dt_sub)))
+        
+        start_time = time.time()
+        print(f"\n[StabilityMapScanner] Starting scan: {self.n_a}x{self.n_e} = {total_points} configurations")
+        print(f"  a0 range: [{self.a_range[0]:.2f}, {self.a_range[1]:.2f}] AU")
+        print(f"  e0 range: [{self.e_range[0]:.2f}, {self.e_range[1]:.2f}]")
+        print(f"  Duration: {self.t_duration:.1f} yr per point ({n_chunks * chunk_steps} substeps)")
+        print(f"  Nominal 3:1 resonance: a_res = {self.nominal_a_res:.4f} AU\n")
+        
+        count = 0
+        for i, a0 in enumerate(a_vals):
+            for j, e0 in enumerate(e_vals):
+                count += 1
+                # Initialize system with this exact (a0, e0)
+                engine.load_preset(2, custom_test_orbit=(float(a0), float(e0)))
+                
+                max_e = engine.e_test
+                min_giant_sep_au = float('inf')
+                min_giant_sep_rh = float('inf')
+                
+                for chunk in range(n_chunks):
+                    verlet_substeps_kernel(chunk_steps, engine.dt_sub)
+                    dt_frame = chunk_steps * engine.dt_sub
+                    engine.time_sim += dt_frame
+                    if engine.stability_state not in ("EJECTED", "COLLISION"):
+                        engine.survival_time += dt_frame
+                        
+                    # Single readback per chunk
+                    pos_all = pos.to_numpy()
+                    vel_all = vel.to_numpy()
+                    
+                    # Update conservation metrics
+                    compute_conservation_metrics_kernel()
+                    e_curr = ke_field[None] + pe_field[None]
+                    lz_curr = lz_field[None]
+                    if engine.e0 is not None and abs(engine.e0) > 1e-12:
+                        engine.delta_e_rel = (e_curr - engine.e0) / abs(engine.e0)
+                    if engine.lz0 is not None and abs(engine.lz0) > 1e-12:
+                        engine.delta_lz_rel = (lz_curr - engine.lz0) / abs(engine.lz0)
+                        
+                    engine._update_diagnostics(pos_all, vel_all)
+                    
+                    max_e = max(max_e, engine.e_test)
+                    d_giant = float(np.linalg.norm(pos_all[3] - pos_all[2]))
+                    min_giant_sep_au = min(min_giant_sep_au, d_giant)
+                    if engine.r_hill_giant > 1e-6:
+                        min_giant_sep_rh = min(min_giant_sep_rh, d_giant / engine.r_hill_giant)
+                        
+                    # Early termination if planet is destroyed or ejected
+                    if engine.stability_state in ("COLLISION", "EJECTED"):
+                        break
+                        
+                record = {
+                    "grid_i": int(i),
+                    "grid_j": int(j),
+                    "a0": float(round(a0, 4)),
+                    "e0": float(round(e0, 4)),
+                    "a_final": float(round(engine.a_test, 4)),
+                    "e_final": float(round(engine.e_test, 4)),
+                    "max_e": float(round(max_e, 4)),
+                    "min_giant_sep_au": float(round(min_giant_sep_au, 4)),
+                    "min_giant_sep_rh": float(round(min_giant_sep_rh, 2)),
+                    "dE_rel": float(engine.delta_e_rel),
+                    "dLz_rel": float(engine.delta_lz_rel),
+                    "classification": str(engine.stability_state),
+                    "survival_time": float(round(engine.survival_time, 2)),
+                }
+                self.results.append(record)
+                
+                if progress_callback:
+                    progress_callback(count, total_points, record)
+                elif count % max(1, total_points // 10) == 0 or count == total_points:
+                    elapsed = time.time() - start_time
+                    rate = count / max(elapsed, 0.001)
+                    eta = (total_points - count) / rate if rate > 0 else 0.0
+                    print(f"  [{count:4d}/{total_points}] ({count/total_points*100:5.1f}%) "
+                          f"a0={a0:.3f} e0={e0:.3f} -> [{record['classification']:9s}] "
+                          f"e_max={max_e:.3f} d_min={min_giant_sep_rh:.1f} R_H | "
+                          f"{rate:.1f} pts/s, ETA: {eta:.1f}s")
+                          
+        total_time = time.time() - start_time
+        print(f"\n[StabilityMapScanner] Scan completed in {total_time:.2f} s ({total_points/max(total_time,0.001):.1f} pts/s)")
+        return self.results
+
+    def save_results(self, filepath="stability_map_data.json"):
+        """Saves scan metadata and full numerical results to JSON."""
+        import json
+        data = {
+            "a_range": list(self.a_range),
+            "e_range": list(self.e_range),
+            "n_a": self.n_a,
+            "n_e": self.n_e,
+            "t_duration": self.t_duration,
+            "dt_sub": self.dt_sub,
+            "nominal_a_res": self.nominal_a_res,
+            "results": self.results
+        }
+        with open(filepath, "w") as f:
+            json.dump(data, f, indent=2)
+        print(f"[StabilityMapScanner] Saved {len(self.results)} points to {filepath}")
+
+    def load_results(self, filepath="stability_map_data.json"):
+        """Loads scan metadata and numerical results from JSON."""
+        import os, json
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            self.a_range = tuple(data["a_range"])
+            self.e_range = tuple(data["e_range"])
+            self.n_a = data["n_a"]
+            self.n_e = data["n_e"]
+            self.t_duration = data["t_duration"]
+            self.dt_sub = data["dt_sub"]
+            self.nominal_a_res = data.get("nominal_a_res", 1.0)
+            self.results = data["results"]
+            print(f"[StabilityMapScanner] Loaded {len(self.results)} points from {filepath}")
+            return True
+        except Exception as e:
+            print(f"[StabilityMapScanner] Could not load {filepath}: {e}")
+            return False
+
+# ==============================================================================
+# 8. RENDERING SYSTEM & GGUI INTERACTION
 # ==============================================================================
 class SimulationRenderer:
     def __init__(self, engine: AstrophysicsEngine, width=1280, height=800):
@@ -919,6 +1093,12 @@ class SimulationRenderer:
         self.width = width
         self.height = height
         self.aspect_ratio = height / width # 800 / 1280 = 0.625
+        self.view_mode = "ORBIT" # "ORBIT" or "MAP"
+        
+        # Stability map scanner & dataset
+        self.scanner = StabilityMapScanner(a_range=(0.70, 1.50), e_range=(0.00, 0.40), n_a=40, n_e=25, t_duration=5.0)
+        self.scanner.load_results("stability_map_data.json")
+        self.selected_point_idx = 0
         
         self.window = ti.ui.Window(
             name="HABITABLE CHAOS — A Computational Laboratory for Planetary Stability",
@@ -939,8 +1119,32 @@ class SimulationRenderer:
         self.glow_centers_np = np.zeros((2, 2), dtype=np.float32)
         self.glow_radii_np = np.zeros(2, dtype=np.float32)
         self.glow_colors_np = np.zeros((2, 3), dtype=np.float32)
+        
+        # Preallocated stability map buffers
+        self.map_centers_np = np.zeros((MAX_MAP_POINTS, 2), dtype=np.float32)
+        self.map_colors_np = np.zeros((MAX_MAP_POINTS, 3), dtype=np.float32)
+        self.map_radii_np = np.zeros(MAX_MAP_POINTS, dtype=np.float32)
+        self.map_axis_verts_np = np.zeros((128, 2), dtype=np.float32)
+        self.map_axis_cols_np = np.zeros((128, 3), dtype=np.float32)
+        self.glow_radii_np = np.zeros(2, dtype=np.float32)
+        self.glow_colors_np = np.zeros((2, 3), dtype=np.float32)
 
     def render_frame(self):
+        eng = self.engine
+        
+        # Deep space astrophysical background
+        self.canvas.set_background_color((0.015, 0.022, 0.035))
+
+        if self.view_mode == "ORBIT":
+            self._render_orbit_view()
+        else:
+            self._render_stability_map_view()
+
+        # Render GGUI control dashboard
+        self._render_gui_dashboard()
+        self.window.show()
+
+    def _render_orbit_view(self):
         eng = self.engine
         
         # Center of view: Star A (0) or System Barycenter (1)
@@ -959,12 +1163,7 @@ class SimulationRenderer:
             sy = 0.5 + ((y - cy) / (scale_au * 2.0))
             return sx, sy
 
-        # Deep space astrophysical background
-        self.canvas.set_background_color((0.015, 0.022, 0.035))
-
-        # ----------------------------------------------------------------------
         # 1. Habitable Zone Annulus & Snow Line Rings (centered on Star A)
-        # ----------------------------------------------------------------------
         star_a_x, star_a_y = pos[0][0], pos[0][1]
         hz_in = eng.hz_inner_au
         hz_out = eng.hz_outer_au
@@ -1002,9 +1201,7 @@ class SimulationRenderer:
         ring_colors.from_numpy(self.ring_cols_np)
         self.canvas.lines(ring_vertices, width=0.0015, per_vertex_color=ring_colors)
 
-        # ----------------------------------------------------------------------
         # 2. Historical Orbital Trajectories (True numerical integration paths)
-        # ----------------------------------------------------------------------
         trail_v_idx = 0
         self.trail_verts_np.fill(0.0)
         self.trail_cols_np.fill(0.0)
@@ -1041,15 +1238,13 @@ class SimulationRenderer:
             trail_colors.from_numpy(self.trail_cols_np)
             self.canvas.lines(trail_vertices, width=0.0018, per_vertex_color=trail_colors)
 
-        # ----------------------------------------------------------------------
         # 3. Celestial Bodies (Stars with Corona Glow + Planets)
-        # ----------------------------------------------------------------------
         for i in range(eng.num_active):
             px, py = pos[i][0], pos[i][1]
             sx, sy = au_to_canvas(px, py)
             self.draw_centers_np[i] = [sx, sy]
 
-        # Draw outer glowing corona for stars
+        # Outer glowing corona for stars
         self.glow_centers_np[0] = self.draw_centers_np[0]
         self.glow_radii_np[0] = 0.024
         self.glow_colors_np[0] = [1.0, 0.82, 0.35]
@@ -1068,7 +1263,7 @@ class SimulationRenderer:
         draw_glow_colors.from_numpy(self.glow_colors_np)
         self.canvas.circles(draw_glow_centers, radius=0.020, per_vertex_color=draw_glow_colors, per_vertex_radius=draw_glow_radii)
 
-        # Draw individual celestial body cores
+        # Individual celestial body cores
         for i in range(MAX_BODIES):
             if i < eng.num_active and active[i] == 1:
                 self.draw_radii_np[i] = 0.012 if i == 0 else (0.009 if i == 1 and mass[1] > 0.05 else (0.007 if i == 2 and eng.num_active >= 4 else 0.0055))
@@ -1083,113 +1278,269 @@ class SimulationRenderer:
         draw_colors.from_numpy(self.draw_colors_np)
         self.canvas.circles(draw_centers, radius=0.006, per_vertex_color=draw_colors, per_vertex_radius=draw_radii)
 
-        # ----------------------------------------------------------------------
-        # 4. Scientific Dashboard (Taichi GGUI Sub-Window)
-        # ----------------------------------------------------------------------
+    def _render_stability_map_view(self):
+        """Renders the (a0, e0) parameter space stability map with 3:1 resonance line."""
+        # Plot area on canvas: X in [0.42, 0.96], Y in [0.12, 0.88]
+        x_min, x_max = 0.42, 0.96
+        y_min, y_max = 0.12, 0.88
+        dx = x_max - x_min
+        dy = y_max - y_min
+        
+        a_min, a_max = self.scanner.a_range
+        e_min, e_max = self.scanner.e_range
+        da = a_max - a_min
+        de = e_max - e_min
+        
+        # 1. Map Axes & Reference Lines
+        v_idx = 0
+        axis_col = [0.35, 0.42, 0.55]
+        
+        # Bounding Box (4 lines = 8 vertices)
+        self.map_axis_verts_np[v_idx] = [x_min, y_min]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        self.map_axis_verts_np[v_idx] = [x_max, y_min]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        
+        self.map_axis_verts_np[v_idx] = [x_max, y_min]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        self.map_axis_verts_np[v_idx] = [x_max, y_max]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        
+        self.map_axis_verts_np[v_idx] = [x_max, y_max]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        self.map_axis_verts_np[v_idx] = [x_min, y_max]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        
+        self.map_axis_verts_np[v_idx] = [x_min, y_max]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        self.map_axis_verts_np[v_idx] = [x_min, y_min]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+        
+        # Nominal 3:1 Resonance line: a_res ~ 1.000 AU
+        res_x = x_min + ((self.scanner.nominal_a_res - a_min) / da) * dx
+        res_col = [0.20, 0.85, 1.0] # Cyan highlight
+        self.map_axis_verts_np[v_idx] = [res_x, y_min]; self.map_axis_cols_np[v_idx] = res_col; v_idx += 1
+        self.map_axis_verts_np[v_idx] = [res_x, y_max]; self.map_axis_cols_np[v_idx] = res_col; v_idx += 1
+        
+        # Grid tick marks on X axis (a0 = 0.8, 1.0, 1.2, 1.4)
+        for tick_a in [0.80, 1.00, 1.20, 1.40]:
+            tx = x_min + ((tick_a - a_min) / da) * dx
+            self.map_axis_verts_np[v_idx] = [tx, y_min]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+            self.map_axis_verts_np[v_idx] = [tx, y_min - 0.015]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+            
+        # Grid tick marks on Y axis (e0 = 0.1, 0.2, 0.3)
+        for tick_e in [0.10, 0.20, 0.30]:
+            ty = y_min + ((tick_e - e_min) / de) * dy
+            self.map_axis_verts_np[v_idx] = [x_min, ty]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+            self.map_axis_verts_np[v_idx] = [x_min - 0.010, ty]; self.map_axis_cols_np[v_idx] = axis_col; v_idx += 1
+
+        # Clear remaining vertices
+        self.map_axis_verts_np[v_idx:].fill(0.0)
+        self.map_axis_cols_np[v_idx:].fill(0.0)
+        
+        map_axis_vertices.from_numpy(self.map_axis_verts_np)
+        map_axis_colors.from_numpy(self.map_axis_cols_np)
+        self.canvas.lines(map_axis_vertices, width=0.002, per_vertex_color=map_axis_colors)
+        
+        # 2. Scanned Grid Points
+        n_res = len(self.scanner.results)
+        self.map_centers_np.fill(2.0)
+        self.map_radii_np.fill(0.0)
+        self.map_colors_np.fill(0.0)
+        
+        col_map = {
+            "STABLE":    [0.15, 0.85, 0.40], # Emerald
+            "PERTURBED": [0.95, 0.80, 0.20], # Amber
+            "UNSTABLE":  [0.95, 0.45, 0.15], # Orange
+            "EJECTED":   [0.80, 0.20, 0.85], # Purple
+            "COLLISION": [0.90, 0.15, 0.15], # Crimson
+        }
+        
+        base_radius = 0.011 if n_res <= 50 else 0.0065
+        for idx in range(min(n_res, MAX_MAP_POINTS)):
+            p = self.scanner.results[idx]
+            px = x_min + ((p["a0"] - a_min) / da) * dx
+            py = y_min + ((p["e0"] - e_min) / de) * dy
+            self.map_centers_np[idx] = [px, py]
+            self.map_colors_np[idx] = col_map.get(p["classification"], [0.5, 0.5, 0.5])
+            if idx == self.selected_point_idx:
+                self.map_radii_np[idx] = base_radius * 2.2
+                self.map_colors_np[idx] = [1.0, 1.0, 1.0] # Highlight white for selected
+            else:
+                self.map_radii_np[idx] = base_radius
+
+        map_point_centers.from_numpy(self.map_centers_np)
+        map_point_colors.from_numpy(self.map_colors_np)
+        map_point_radii.from_numpy(self.map_radii_np)
+        self.canvas.circles(map_point_centers, radius=base_radius, per_vertex_color=map_point_colors, per_vertex_radius=map_point_radii)
+
+    def _render_gui_dashboard(self):
+        eng = self.engine
         gui = self.gui
-        gui.begin("Scientific Laboratory", 0.015, 0.02, 0.36, 0.96)
+        gui.begin("Scientific Laboratory", 0.015, 0.02, 0.38, 0.96)
         
         gui.text("HABITABLE CHAOS: Astrophysics Lab")
         gui.text("----------------------------------------")
-        status_text = f"Simulation Clock: {eng.time_sim:.2f} yr | {'[PAUSED]' if eng.paused else '[RUNNING]'}"
-        gui.text(status_text)
         
-        # System Architecture
-        gui.text("----------------------------------------")
-        gui.text("1. SYSTEM ARCHITECTURE")
-        gui.text(f"Preset [{eng.preset_id}]: {eng.target_resonance_label}")
-        if gui.button("Preset 1: S-Type Binary (Calm HZ)"):
-            eng.load_preset(1)
-        if gui.button("Preset 2: Nominal 3:1 MMR (Resonance)"):
-            eng.load_preset(2)
-        if gui.button("Preset 3: Tight Binary Intruder"):
-            eng.load_preset(3)
-        if gui.button("Preset 4: Kepler 3rd Law Benchmark"):
-            eng.load_preset(4)
-
-        # Numerical Fidelity & Conservation
-        gui.text("----------------------------------------")
-        gui.text("2. NUMERICAL CONSERVATION (Symplectic)")
-        gui.text(f"Substeps/frame: {eng.substeps} | dt: {eng.dt_sub:.5f} yr")
-        gui.text(f"Energy Drift dE/E0:     {eng.delta_e_rel:+.3e}")
-        gui.text(f"Ang. Momentum dLz/Lz0:  {eng.delta_lz_rel:+.3e}")
-        gui.text(f"Softening eps: {DEFAULT_EPSILON:.3f} AU (r < eps unphysical)")
-        
-        # Test Planet Raw Orbital Diagnostics
-        gui.text("----------------------------------------")
-        gui.text("3. TEST PLANET ORBITAL DIAGNOSTICS")
-        gui.text("(Osculating 2-body elements relative to Star A)")
-        gui.text(f"Instantaneous dist r:   {eng.r_test:.4f} AU")
-        gui.text(f"Orbital speed v:        {eng.v_test:.4f} AU/yr ({eng.v_test * 4.74:.1f} km/s)")
-        gui.text(f"Osculating semimajor a: {eng.a_test:.4f} AU")
-        da_a0 = (eng.a_test - eng.a0_test) / eng.a0_test if eng.a0_test > 0 else 0.0
-        gui.text(f"Semimajor drift da/a0:  {da_a0:+.3%}")
-        gui.text(f"Osculating ecc e(t):    {eng.e_test:.4f}")
-        gui.text(f"Periapsis / Apoapsis:   {eng.peri_test:.3f} / {eng.apo_test:.3f} AU")
-        gui.text(f"Barycentric Energy:     {eng.bary_energy_test:+.4f} AU^2/yr^2")
-
-        # Resonance Diagnostics (3:1 MMR)
-        if eng.num_active >= 4:
+        # View Mode Switcher
+        mode_btn_label = "Switch to STABILITY MAP VIEW" if self.view_mode == "ORBIT" else "Switch to ORBIT SIMULATION"
+        if gui.button(mode_btn_label):
+            self.view_mode = "MAP" if self.view_mode == "ORBIT" else "ORBIT"
+            
+        if self.view_mode == "MAP":
+            # ------------------------------------------------------------------
+            # STABILITY MAP DASHBOARD
+            # ------------------------------------------------------------------
             gui.text("----------------------------------------")
-            gui.text("4. 3:1 RESONANT ANGLE DIAGNOSTIC")
-            gui.text(f"Giant Semimajor a_J:    {eng.a_giant:.3f} AU (e = {eng.e_giant:.3f})")
-            gui.text(f"Semimajor Ratio a_J/a_t:{eng.a_ratio:.3f}")
-            gui.text(f"Period Ratio P_J/P_t:   {eng.period_ratio:.3f}")
-            gui.text(f"Resonant Angle phi:     {eng.phi_3_1_deg:.1f}° ({eng.phi_3_1:.3f} rad)")
-            gui.text(f"Resonance Classification:")
-            gui.text(f"  {eng.resonance_state}")
-            if eng.preset_id == 2:
-                gui.text("  (phi = 3*lambda_J - lambda_t - 2*varpi_t)")
+            gui.text("STABILITY MAP: 'Where do orbits survive?'")
+            gui.text("Primary Experiment: Preset 2 System")
+            gui.text("  Binary Stars (1.0 + 0.35 M_sun)")
+            gui.text("  Giant Perturber at 2.0801 AU")
+            gui.text(f"  Parameter Space:")
+            gui.text(f"    a0 in [{self.scanner.a_range[0]:.2f}, {self.scanner.a_range[1]:.2f}] AU (X-axis)")
+            gui.text(f"    e0 in [{self.scanner.e_range[0]:.2f}, {self.scanner.e_range[1]:.2f}] (Y-axis)")
+            gui.text(f"  Nominal 3:1 Resonance: a_res = {self.scanner.nominal_a_res:.3f} AU")
+            gui.text("  (Cyan vertical line = reference marker)")
+            
+            gui.text("----------------------------------------")
+            gui.text("HEADLESS SCAN CONTROLS:")
+            if gui.button("Run Quick Test Scan (8x5 = 40 pts)"):
+                self.scanner.n_a = 8
+                self.scanner.n_e = 5
+                self.scanner.run_scan()
+                self.scanner.save_results("stability_map_data.json")
+            if gui.button("Run Full Scan (40x25 = 1000 pts)"):
+                self.scanner.n_a = 40
+                self.scanner.n_e = 25
+                self.scanner.run_scan()
+                self.scanner.save_results("stability_map_data.json")
 
-        # Stellar Insolation & Habitable Zone
-        gui.text("----------------------------------------")
-        gui.text("5. STELLAR IRRADIATION & HZ")
-        gui.text(f"Star A Luminosity:      {eng.primary_luminosity:.3f} L_sun")
-        gui.text(f"Total Received Flux:    {eng.total_flux_test:.3f} S_sun")
-        gui.text(f"Approximate HZ Flux:    [0.53 - 1.11] S_sun")
-        gui.text(f"Radiative State:        {eng.flux_status}")
-        gui.text(f"Luminosity Snow Line:   {eng.snow_line_au:.2f} AU")
-        gui.text("(Simplified flux proxy; does not model climate)")
+            gui.text("----------------------------------------")
+            gui.text("CLASSIFICATION LEGEND:")
+            gui.text("  [GREEN]   STABLE (e < 0.2, drift < 12%)")
+            gui.text("  [YELLOW]  PERTURBED (e >= 0.2 or sep < 3 Rh)")
+            gui.text("  [ORANGE]  UNSTABLE (e >= 0.7 or sep < 1 Rh)")
+            gui.text("  [PURPLE]  EJECTED (r_bary > 40 AU, E > 0)")
+            gui.text("  [RED]     COLLISION (r < r_star + r_test)")
 
-        # Operational Stability Classification
-        gui.text("----------------------------------------")
-        gui.text("6. OPERATIONAL STABILITY CATEGORY")
-        gui.text(f"Classification:         [{eng.stability_state}]")
-        gui.text(f"Survival Time:          {eng.survival_time:.2f} yr")
-        if eng.num_active >= 4:
-            gui.text(f"Giant Hill Radius R_H:  {eng.r_hill_giant:.3f} AU")
-            gui.text(f"Current Separation:     {eng.hill_sep:.2f} R_H")
-        gui.text("(Operational categories based on Hill separation,")
-        gui.text(" not universal physical theorems.)")
+            n_pts = len(self.scanner.results)
+            gui.text("----------------------------------------")
+            gui.text(f"POINT INSPECTOR ({n_pts} points available):")
+            if n_pts > 0:
+                self.selected_point_idx = gui.slider_int("Select Point", self.selected_point_idx, 0, n_pts - 1)
+                p = self.scanner.results[self.selected_point_idx]
+                gui.text(f"  Initial a0:      {p['a0']:.4f} AU")
+                gui.text(f"  Initial e0:      {p['e0']:.4f}")
+                gui.text(f"  Final a:         {p['a_final']:.4f} AU")
+                gui.text(f"  Final e:         {p['e_final']:.4f}")
+                gui.text(f"  Maximum e:       {p['max_e']:.4f}")
+                gui.text(f"  Min Giant Sep:   {p['min_giant_sep_au']:.4f} AU ({p['min_giant_sep_rh']:.1f} R_H)")
+                gui.text(f"  Energy Drift:    {p['dE_rel']:+.3e}")
+                gui.text(f"  Lz Drift:        {p['dLz_rel']:+.3e}")
+                gui.text(f"  Classification:  [{p['classification']}]")
+                gui.text(f"  Survival Time:   {p['survival_time']:.2f} yr")
 
-        # Kepler 3rd Law Validation Monitor
-        gui.text("----------------------------------------")
-        gui.text("7. EMPIRICAL KEPLER VALIDATION")
-        gui.text(f"Measured Revolutions:   {len(eng.measured_periods)}")
-        if len(eng.measured_periods) > 0:
-            last_p = eng.measured_periods[-1]
-            gui.text(f"Empirical Period P:     {last_p:.4f} yr")
-            gui.text(f"Kepler Ratio P^2/a^3:   {eng.kepler_ratio_p2_over_a3:.4f}")
-            gui.text(f"Kepler Error vs Theory: {eng.kepler_relative_error:.2f}%")
+                if gui.button("--> LOAD INTO SIMULATION <--"):
+                    eng.load_preset(2, custom_test_orbit=(p['a0'], p['e0']))
+                    self.view_mode = "ORBIT"
+                    eng.paused = False
+            else:
+                gui.text("  No scan data found. Click a scan button above")
+                gui.text("  or run 'python sim.py --scan'.")
         else:
-            gui.text("Accumulating full 2*pi revolution...")
+            # ------------------------------------------------------------------
+            # ORBIT SIMULATION DASHBOARD (Existing 8 Panels)
+            # ------------------------------------------------------------------
+            status_text = f"Simulation Clock: {eng.time_sim:.2f} yr | {'[PAUSED]' if eng.paused else '[RUNNING]'}"
+            gui.text(status_text)
+            
+            # System Architecture
+            gui.text("----------------------------------------")
+            gui.text("1. SYSTEM ARCHITECTURE")
+            gui.text(f"Preset [{eng.preset_id}]: {eng.target_resonance_label}")
+            if gui.button("Preset 1: S-Type Binary (Calm HZ)"):
+                eng.load_preset(1)
+            if gui.button("Preset 2: Nominal 3:1 MMR (Resonance)"):
+                eng.load_preset(2)
+            if gui.button("Preset 3: Tight Binary Intruder"):
+                eng.load_preset(3)
+            if gui.button("Preset 4: Kepler 3rd Law Benchmark"):
+                eng.load_preset(4)
 
-        # Interactive Controls
-        gui.text("----------------------------------------")
-        gui.text("8. INTERACTIVE CONTROLS")
-        if gui.button("Pause / Resume (SPACE)"):
-            eng.paused = not eng.paused
-        if gui.button("Reset Scenario (R)"):
-            eng.load_preset(eng.preset_id)
-        if gui.button("Focus: " + ("Primary Star" if eng.view_focus == 0 else "Barycenter")):
-            eng.view_focus = 1 - eng.view_focus
+            # Numerical Fidelity & Conservation
+            gui.text("----------------------------------------")
+            gui.text("2. NUMERICAL CONSERVATION (Symplectic)")
+            gui.text(f"Substeps/frame: {eng.substeps} | dt: {eng.dt_sub:.5f} yr")
+            gui.text(f"Energy Drift dE/E0:     {eng.delta_e_rel:+.3e}")
+            gui.text(f"Ang. Momentum dLz/Lz0:  {eng.delta_lz_rel:+.3e}")
+            gui.text(f"Softening eps: {DEFAULT_EPSILON:.3f} AU (r < eps unphysical)")
+            
+            # Test Planet Raw Orbital Diagnostics
+            gui.text("----------------------------------------")
+            gui.text("3. TEST PLANET ORBITAL DIAGNOSTICS")
+            gui.text("(Osculating 2-body elements relative to Star A)")
+            gui.text(f"Instantaneous dist r:   {eng.r_test:.4f} AU")
+            gui.text(f"Orbital speed v:        {eng.v_test:.4f} AU/yr ({eng.v_test * 4.74:.1f} km/s)")
+            gui.text(f"Osculating semimajor a: {eng.a_test:.4f} AU")
+            da_a0 = (eng.a_test - eng.a0_test) / eng.a0_test if eng.a0_test > 0 else 0.0
+            gui.text(f"Semimajor drift da/a0:  {da_a0:+.3%}")
+            gui.text(f"Osculating ecc e(t):    {eng.e_test:.4f}")
+            gui.text(f"Periapsis / Apoapsis:   {eng.peri_test:.3f} / {eng.apo_test:.3f} AU")
+            gui.text(f"Barycentric Energy:     {eng.bary_energy_test:+.4f} AU^2/yr^2")
 
-        eng.view_scale_au = gui.slider_float("View Scale (AU)", eng.view_scale_au, 1.0, 30.0)
-        eng.substeps = gui.slider_int("Substeps/frame", eng.substeps, 10, 400)
-        eng.dt_sub = gui.slider_float("dt step (yr)", eng.dt_sub, 0.00005, 0.001)
+            # Resonance Diagnostics (3:1 MMR)
+            if eng.num_active >= 4:
+                gui.text("----------------------------------------")
+                gui.text("4. 3:1 RESONANT ANGLE DIAGNOSTIC")
+                gui.text(f"Giant Semimajor a_J:    {eng.a_giant:.3f} AU (e = {eng.e_giant:.3f})")
+                gui.text(f"Semimajor Ratio a_J/a_t:{eng.a_ratio:.3f}")
+                gui.text(f"Period Ratio P_J/P_t:   {eng.period_ratio:.3f}")
+                gui.text(f"Resonant Angle phi:     {eng.phi_3_1_deg:.1f}° ({eng.phi_3_1:.3f} rad)")
+                gui.text(f"Resonance Classification:")
+                gui.text(f"  {eng.resonance_state}")
+                if eng.preset_id == 2:
+                    gui.text("  (phi = 3*lambda_J - lambda_t - 2*varpi_t)")
+
+            # Stellar Insolation & Habitable Zone
+            gui.text("----------------------------------------")
+            gui.text("5. STELLAR IRRADIATION & HZ")
+            gui.text(f"Star A Luminosity:      {eng.primary_luminosity:.3f} L_sun")
+            gui.text(f"Total Received Flux:    {eng.total_flux_test:.3f} S_sun")
+            gui.text(f"Approximate HZ Flux:    [0.53 - 1.11] S_sun")
+            gui.text(f"Radiative State:        {eng.flux_status}")
+            gui.text(f"Luminosity Snow Line:   {eng.snow_line_au:.2f} AU")
+            gui.text("(Simplified flux proxy; does not model climate)")
+
+            # Operational Stability Classification
+            gui.text("----------------------------------------")
+            gui.text("6. OPERATIONAL STABILITY CATEGORY")
+            gui.text(f"Classification:         [{eng.stability_state}]")
+            gui.text(f"Survival Time:          {eng.survival_time:.2f} yr")
+            if eng.num_active >= 4:
+                gui.text(f"Giant Hill Radius R_H:  {eng.r_hill_giant:.3f} AU")
+                gui.text(f"Current Separation:     {eng.hill_sep:.2f} R_H")
+            gui.text("(Operational categories based on Hill separation,")
+            gui.text(" not universal physical theorems.)")
+
+            # Kepler 3rd Law Validation Monitor
+            gui.text("----------------------------------------")
+            gui.text("7. EMPIRICAL KEPLER VALIDATION")
+            gui.text(f"Measured Revolutions:   {len(eng.measured_periods)}")
+            if len(eng.measured_periods) > 0:
+                last_p = eng.measured_periods[-1]
+                gui.text(f"Empirical Period P:     {last_p:.4f} yr")
+                gui.text(f"Kepler Ratio P^2/a^3:   {eng.kepler_ratio_p2_over_a3:.4f}")
+                gui.text(f"Kepler Error vs Theory: {eng.kepler_relative_error:.2f}%")
+            else:
+                gui.text("Accumulating full 2*pi revolution...")
+
+            # Interactive Controls
+            gui.text("----------------------------------------")
+            gui.text("8. INTERACTIVE CONTROLS")
+            if gui.button("Pause / Resume (SPACE)"):
+                eng.paused = not eng.paused
+            if gui.button("Reset Scenario (R)"):
+                eng.load_preset(eng.preset_id, eng.custom_test_orbit)
+            if gui.button("Focus: " + ("Primary Star" if eng.view_focus == 0 else "Barycenter")):
+                eng.view_focus = 1 - eng.view_focus
+
+            eng.view_scale_au = gui.slider_float("View Scale (AU)", eng.view_scale_au, 1.0, 30.0)
+            eng.substeps = gui.slider_int("Substeps/frame", eng.substeps, 10, 400)
+            eng.dt_sub = gui.slider_float("dt step (yr)", eng.dt_sub, 0.00005, 0.001)
 
         gui.end()
-        self.window.show()
 
     def process_events(self):
         """Handles keyboard and GUI interaction events."""
@@ -1318,11 +1669,24 @@ def run_headless_verification():
 def main():
     parser = argparse.ArgumentParser(description="HABITABLE CHAOS: Astrophysics Simulation")
     parser.add_argument("--verify", action="store_true", help="Run automated headless scientific verification suite")
+    parser.add_argument("--scan", action="store_true", help="Run headless stability map parameter scan")
+    parser.add_argument("--grid", type=str, default="8x5", help="Grid resolution for scan (e.g. 8x5 or 40x25)")
+    parser.add_argument("--duration", type=float, default=5.0, help="Integration duration per point in years")
     parser.add_argument("--preset", type=int, default=1, choices=[1, 2, 3, 4], help="Initial scenario preset (1-4)")
     args = parser.parse_args()
 
     if args.verify:
         sys.exit(run_headless_verification())
+
+    if args.scan:
+        parts = args.grid.lower().split("x")
+        n_a = int(parts[0])
+        n_e = int(parts[1]) if len(parts) > 1 else n_a
+        scanner = StabilityMapScanner(a_range=(0.70, 1.50), e_range=(0.00, 0.40),
+                                      n_a=n_a, n_e=n_e, t_duration=args.duration)
+        scanner.run_scan()
+        scanner.save_results("stability_map_data.json")
+        sys.exit(0)
 
     # Interactive GUI mode
     arch, backend_name = ACTIVE_ARCH, ACTIVE_BACKEND_NAME
@@ -1335,6 +1699,7 @@ def main():
     print("  SPACE : Pause / Resume")
     print("  R     : Reset current scenario")
     print("  1-4   : Switch scenario presets")
+    print("  M     : Toggle Stability Map view mode")
     print("  ESC   : Exit simulation cleanly\n")
     
     last_fps_time = time.time()
@@ -1342,7 +1707,8 @@ def main():
 
     while renderer.window.running:
         renderer.process_events()
-        engine.step_simulation()
+        if renderer.view_mode == "ORBIT":
+            engine.step_simulation()
         renderer.render_frame()
         
         frames += 1
@@ -1350,7 +1716,7 @@ def main():
         if curr_time - last_fps_time >= 2.0:
             fps = frames / (curr_time - last_fps_time)
             # Log FPS periodically to console
-            print(f"[Diagnostics] FPS: {fps:.1f} | Clock: {engine.time_sim:.2f} yr | dE/E0: {engine.delta_e_rel:+.2e} | Status: {engine.stability_state}", flush=True)
+            print(f"[Diagnostics] FPS: {fps:.1f} | Mode: {renderer.view_mode} | Clock: {engine.time_sim:.2f} yr | dE/E0: {engine.delta_e_rel:+.2e} | Status: {engine.stability_state}", flush=True)
             frames = 0
             last_fps_time = curr_time
 
